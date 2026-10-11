@@ -1,0 +1,334 @@
+"""
+ULTRON Core — Context Manager
+===============================
+Short-term memory for ULTRON. Tracks everything the AI needs to know
+about the current situation:
+
+  - Who is present (IDs, dwell times)
+  - Conversation state (greeting given, last speech)
+  - Security state
+  - Recent events
+
+This context is assembled into a structured prompt for the LLM
+so ULTRON always knows what's happening right now.
+"""
+
+import time
+import threading
+from dataclasses import dataclass, field
+
+from core.event_bus import EventBus, EventTypes, Event
+import config
+
+
+@dataclass
+class PersonContext:
+    """Tracking context for a single person."""
+
+    track_id: int
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    departed_at: float = 0.0
+    departure_duration: float = 0.0
+    reentry_time: float = 0.0
+    greeting_given: bool = False
+    remark_given: bool = False
+    holding_phone: bool = False
+    holding_weapon: bool = False
+    weapon_type: str = ""
+    persuasion_count: int = 0
+    last_persuasion_time: float = 0.0
+    is_reentry: bool = False
+
+    @property
+    def dwell_time(self) -> float:
+        """How long this person has been present in seconds (real-time clock)."""
+        return max(0.0, time.time() - self.first_seen)
+
+
+class ContextManager:
+    """
+    ULTRON's short-term memory.
+
+    Maintains awareness of:
+      - Current persons and their dwell times
+      - Whether greetings have been given
+      - Conversation history
+      - Current security state
+      - Recent events summary
+
+    This is the single source of truth that gets fed to the LLM.
+    """
+
+    def __init__(self, event_bus: EventBus):
+        self._bus = event_bus
+        self._lock = threading.Lock()
+
+        # Person tracking
+        self._persons: dict[int, PersonContext] = {}
+        self._departed_persons: dict[int, PersonContext] = {}
+
+        # Conversation
+        self._conversation_history: list[dict[str, str]] = []
+        self._max_conversation = 20  # Keep last N exchanges
+
+        # Security
+        self._security_state = config.SecurityState.MONITORING
+        self._security_reason = ""
+
+        # Audio
+        self._last_speech_text: str = ""
+        self._last_speech_time: float = 0.0
+        self._is_whisper: bool = False
+
+        # Subscribe to events
+        self._bus.subscribe(EventTypes.PERSON_ENTERED, self._on_person_entered)
+        self._bus.subscribe(EventTypes.PERSON_LEFT, self._on_person_left)
+        self._bus.subscribe(EventTypes.STATE_CHANGED, self._on_state_changed)
+        self._bus.subscribe(EventTypes.SPEECH_RECOGNIZED, self._on_speech)
+        self._bus.subscribe(EventTypes.RESPONSE_GENERATED, self._on_response)
+
+    # ── Person Tracking ─────────────────────────────────────────────
+
+    def update_person(
+        self,
+        track_id: int,
+        holding_phone: bool = False,
+        holding_weapon: bool = False,
+        weapon_type: str = "",
+    ):
+        """Update the last-seen time, phone, and weapon state for a tracked person."""
+        now = time.time()
+        with self._lock:
+            if track_id in self._persons:
+                self._persons[track_id].last_seen = now
+                self._persons[track_id].holding_phone = holding_phone
+                self._persons[track_id].holding_weapon = holding_weapon
+                self._persons[track_id].weapon_type = weapon_type
+            elif track_id in self._departed_persons:
+                # Returning visitor: restore their context & greeting status
+                p = self._departed_persons.pop(track_id)
+                dep_time = p.departed_at if p.departed_at > 0 else p.last_seen
+                duration = max(0.0, now - dep_time)
+                p.departure_duration = duration
+                p.last_seen = now
+                p.holding_phone = holding_phone
+                p.holding_weapon = holding_weapon
+                p.weapon_type = weapon_type
+                min_dep = getattr(config, "REENTRY_MIN_DEPARTURE_S", 25.0)
+                if duration >= min_dep:
+                    p.is_reentry = True
+                    p.reentry_time = now
+                else:
+                    p.is_reentry = False
+                self._persons[track_id] = p
+            else:
+                self._persons[track_id] = PersonContext(
+                    track_id=track_id,
+                    holding_phone=holding_phone,
+                    holding_weapon=holding_weapon,
+                    weapon_type=weapon_type,
+                )
+
+    def sync_active_persons(self, active_track_ids: set[int]):
+        """Ensure self._persons only contains currently active IDs, moving departed ones to departed_persons."""
+        now = time.time()
+        with self._lock:
+            stale_ids = [tid for tid in self._persons if tid not in active_track_ids]
+            for tid in stale_ids:
+                p = self._persons.pop(tid)
+                p.last_seen = now
+                p.departed_at = now
+                self._departed_persons[tid] = p
+
+    def mark_greeting_given(self, track_id: int):
+        """Mark that ULTRON has greeted this person."""
+        with self._lock:
+            if track_id in self._persons:
+                self._persons[track_id].greeting_given = True
+
+    def mark_remark_given(self, track_id: int):
+        """Mark that ULTRON has delivered a presence/silence remark to this person."""
+        with self._lock:
+            if track_id in self._persons:
+                self._persons[track_id].remark_given = True
+
+    def record_persuasion(self, track_id: int) -> int:
+        """Record that a departure persuasion remark was made to this person, returning current level."""
+        with self._lock:
+            if track_id in self._persons:
+                p = self._persons[track_id]
+                p.persuasion_count += 1
+                p.last_persuasion_time = time.time()
+                return p.persuasion_count
+            return 1
+
+    def get_ungreeted_persons(self) -> list[PersonContext]:
+        """Get persons who haven't been greeted yet."""
+        with self._lock:
+            return [
+                p for p in self._persons.values() if not p.greeting_given
+            ]
+
+    @property
+    def person_count(self) -> int:
+        with self._lock:
+            return len(self._persons)
+
+    @property
+    def persons(self) -> list[PersonContext]:
+        with self._lock:
+            return list(self._persons.values())
+
+    # ── Conversation ────────────────────────────────────────────────
+
+    def add_conversation(self, role: str, text: str):
+        """Add a conversation entry (role: 'human' or 'ultron')."""
+        with self._lock:
+            self._conversation_history.append({
+                "role": role,
+                "text": text,
+                "time": time.time(),
+            })
+            if len(self._conversation_history) > self._max_conversation:
+                self._conversation_history = self._conversation_history[
+                    -self._max_conversation:
+                ]
+
+    @property
+    def conversation_history(self) -> list[dict]:
+        with self._lock:
+            return list(self._conversation_history)
+
+    # ── Context Assembly (for LLM) ──────────────────────────────────
+
+    def get_situation_summary(self) -> str:
+        """
+        Assemble a structured text summary of the current situation.
+        This gets injected into the LLM prompt as context.
+        """
+        def _qualitative_dwell(seconds: float) -> str:
+            if seconds < 15:
+                return "just arrived"
+            elif seconds < 45:
+                return "here for half a minute"
+            elif seconds < 90:
+                return "present for about a minute"
+            elif seconds < 180:
+                return "lingering for a couple of minutes"
+            else:
+                return "lingering for several minutes"
+
+        with self._lock:
+            lines = ["[CURRENT SITUATION]"]
+            lines.append(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"Security state: {self._security_state}")
+            if self._security_reason:
+                lines.append(f"State reason: {self._security_reason}")
+
+            num_persons = len(self._persons)
+            lines.append(f"Persons detected: {num_persons}")
+            if num_persons == 1:
+                lines.append("Note: Only 1 person is present in front of the camera (do NOT say 'another one arrived' or assume a group).")
+
+            now = time.time()
+            for p in self._persons.values():
+                # Expire re-entry flag after 20s so it does not persist across future exchanges
+                if p.is_reentry and (now - p.reentry_time) > 20.0:
+                    p.is_reentry = False
+
+                if p.is_reentry:
+                    dwell_str = "returned after stepping away momentarily"
+                else:
+                    dwell_str = _qualitative_dwell(p.dwell_time)
+                greeted = "YES" if p.greeting_given else "NO"
+                phone_tag = ", HOLDING PHONE / RECORDING: YES" if p.holding_phone else ""
+                weapon_tag = f", HOLDING WEAPON: {p.weapon_type} (ARMED THREAT)" if p.holding_weapon else ""
+                lines.append(
+                    f"  Person ID:{p.track_id} — duration: {dwell_str}, greeted: {greeted}, departure_prompts_given: {p.persuasion_count}{phone_tag}{weapon_tag}"
+                )
+
+            armed_persons = [p for p in self._persons.values() if p.holding_weapon]
+            if armed_persons:
+                for ap in armed_persons:
+                    lines.append(
+                        f"CRITICAL ALERT: Person ID:{ap.track_id} is brandishing a {ap.weapon_type}! "
+                        f"Order them immediately and sternly to drop or put the weapon away and step back."
+                    )
+
+            if self._last_speech_text:
+                lines.append(f"Last person speech: \"{self._last_speech_text}\"")
+                if getattr(config, "WHISPER_DETECTION_ENABLED", False) and self._is_whisper:
+                    lines.append("Speech type: normal (WHISPERED)")
+                ago = int(time.time() - self._last_speech_time)
+                ago_str = "just now" if ago < 10 else "a moment ago" if ago < 60 else "a few minutes ago"
+                lines.append(f"Speech timing: {ago_str}")
+
+            # Recent conversation
+            recent = self._conversation_history[-4:]  # Last 4 exchanges
+            if recent:
+                lines.append("Recent conversation:")
+                for entry in recent:
+                    role = "PERSON" if entry["role"] == "human" else "ULTRON"
+                    lines.append(f"  {role}: \"{entry['text']}\"")
+
+            return "\n".join(lines)
+
+    # ── Event Handlers ──────────────────────────────────────────────
+
+    def _on_person_entered(self, event: Event):
+        track_id = event.data.get("track_id", -1)
+        if track_id >= 0:
+            now = time.time()
+            with self._lock:
+                if track_id in self._departed_persons:
+                    p = self._departed_persons.pop(track_id)
+                    dep_time = p.departed_at if p.departed_at > 0 else p.last_seen
+                    duration = max(0.0, now - dep_time)
+                    p.departure_duration = duration
+                    p.last_seen = now
+                    min_dep = getattr(config, "REENTRY_MIN_DEPARTURE_S", 25.0)
+                    if duration >= min_dep:
+                        p.is_reentry = True
+                        p.reentry_time = now
+                    else:
+                        p.is_reentry = False
+                    self._persons[track_id] = p
+                elif track_id not in self._persons:
+                    self._persons[track_id] = PersonContext(track_id=track_id)
+
+    def _on_person_left(self, event: Event):
+        track_id = event.data.get("track_id", -1)
+        now = time.time()
+        with self._lock:
+            if track_id in self._persons:
+                p = self._persons.pop(track_id)
+                p.last_seen = now
+                p.departed_at = now
+                self._departed_persons[track_id] = p
+
+    def _on_state_changed(self, event: Event):
+        with self._lock:
+            self._security_state = event.data.get("new_state", "UNKNOWN")
+            self._security_reason = event.data.get("reason", "")
+
+    def _on_speech(self, event: Event):
+        with self._lock:
+            self._last_speech_text = event.data.get("text", "")
+            self._last_speech_time = time.time()
+            self._is_whisper = event.data.get("is_whisper", False)
+            self._conversation_history.append({
+                "role": "human",
+                "text": self._last_speech_text,
+                "time": time.time(),
+            })
+
+    def _on_response(self, event: Event):
+        text = event.data.get("text", "")
+        if text:
+            with self._lock:
+                self._conversation_history.append({
+                    "role": "ultron",
+                    "text": text,
+                    "time": time.time(),
+                })
